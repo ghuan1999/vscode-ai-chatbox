@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { $, append, clearNode, h } from '../../../../base/browser/dom.js';
-import { KeybindingLabel } from '../../../../base/browser/ui/keybindingLabel/keybindingLabel.js';
 import { coalesce, shuffle } from '../../../../base/common/arrays.js';
 import { Disposable, DisposableStore } from '../../../../base/common/lifecycle.js';
 import { isMacintosh, isWeb, OS } from '../../../../base/common/platform.js';
@@ -14,7 +13,6 @@ import { IConfigurationService } from '../../../../platform/configuration/common
 import { ContextKeyExpr, ContextKeyExpression, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
 import { IKeybindingService } from '../../../../platform/keybinding/common/keybinding.js';
 import { IStorageService, StorageScope, StorageTarget, WillSaveStateReason } from '../../../../platform/storage/common/storage.js';
-import { defaultKeybindingLabelStyles } from '../../../../platform/theme/browser/defaultStyles.js';
 import { editorForeground, registerColor, transparent } from '../../../../platform/theme/common/colorRegistry.js';
 import { IWorkspaceContextService, WorkbenchState } from '../../../../platform/workspace/common/workspace.js';
 
@@ -141,53 +139,109 @@ export class EditorGroupWatermark extends Disposable {
 		clearNode(this.shortcuts);
 		this.transientDisposables.clear();
 
-		if (!this.enabled) {
-			return;
-		}
+		const aiApp = append(this.shortcuts, $('.ai-app-container'));
+		aiApp.style.overflowY = 'auto';
 
-		const fixedEntries = this.filterEntries(this.workbenchState !== WorkbenchState.EMPTY ? workspaceEntries : emptyWindowEntries, false /* not shuffled */);
-		const randomEntries = this.filterEntries(this.workbenchState !== WorkbenchState.EMPTY ? randomWorkspaceEntries : randomEmptyWindowEntries, true /* shuffled */).slice(0, Math.max(0, 5 - fixedEntries.length));
-		const entries = [...fixedEntries, ...randomEntries];
+		// --- Embedded Browser ---
+		const browser = append(aiApp, $('.ai-browser'));
+		const input = append(browser, $('input')) as HTMLInputElement;
+		input.placeholder = 'Enter website URL and press Enter...';
+		const iframeWrapper = append(browser, $('.ai-browser iframe'));
+		const iframe = append(iframeWrapper, $('iframe')) as HTMLIFrameElement;
 
-		const box = append(this.shortcuts, $('.watermark-box'));
+		input.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter' && input.value) {
+				let url = input.value.trim();
+				if (!url.startsWith('http')) url = `https://${url}`;
 
-		const update = () => {
-			clearNode(box);
-			this.keybindingLabels.clear();
+				// Reset hiển thị
+				// fallbackContainer.style.display = 'none';
+				iframe.style.display = 'block';
+				iframe.src = url;
+			}
+		});
 
-			for (const entry of entries) {
-				const keys = this.keybindingService.lookupKeybinding(entry.id);
-				if (!keys) {
-					continue;
+		// --- Chat Section ---
+		const chat = append(aiApp, $('.ai-chat'));
+		const messages = append(chat, $('.ai-chat-messages'));
+		const inputArea = append(chat, $('.ai-chat-input'));
+		const chatInput = append(inputArea, $('input')) as HTMLInputElement;
+		chatInput.placeholder = 'Ask AI about the website content...';
+		const sendBtn = append(inputArea, $('button'));
+		sendBtn.textContent = 'Send';
+
+		// Ngăn double-click mở file mới
+		aiApp.querySelectorAll('input, button, iframe, div').forEach(el => {
+			el.addEventListener('dblclick', e => e.stopPropagation());
+			el.addEventListener('mousedown', e => e.stopPropagation());
+		});
+
+		let chatHistory = [
+			{ role: "system", content: "You are a helpful assistant." }
+		];
+
+		sendBtn.addEventListener('click', async () => {
+			const question = chatInput.value.trim();
+			if (!question) return;
+
+			const userMsg = append(messages, $('div'));
+			userMsg.textContent = `You: ${question}`;
+			chatInput.value = '';
+
+			const aiMsg = append(messages, $('div'));
+			aiMsg.textContent = 'AI: (thinking...)';
+
+			// Xử lý cho LLM ghi nhớ được lịch sử đoạn hội thoại, hay còn gọi là context window
+			chatHistory.push({ role: "user", content: question });
+			const conversationText = chatHistory
+				.map(msg => `${msg.role === "user" ? "User" : "Assistant"}: ${msg.content}`)
+				.join("\n");
+
+			try {
+				// Lấy nội dung web
+				const url = input.value.trim();
+				const isSummaryRequest = /(tóm tắt|summary|summarize|give me a summary|short version)/i.test(question);
+
+				let prompt = '';
+				if (isSummaryRequest && url) {
+					prompt = `${conversationText}User: ${question}Assistant: Please summarize the main content of this website: ${url}`;
+				} else {
+					prompt = `${conversationText}User: ${question}`;
 				}
 
-				const dl = append(box, $('dl'));
-				const dt = append(dl, $('dt'));
-				dt.textContent = entry.text;
+				//  Gửi prompt tới OpenAI
+				const response = await fetch("http://localhost:3000/chat", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						message: prompt,
+						// content: chatHistory, // nếu bạn có nội dung trang
+						website: url
+					}),
+				});
+				const summary = await response.json();
 
-				const dd = append(dl, $('dd'));
-
-				const label = this.keybindingLabels.add(new KeybindingLabel(dd, OS, { renderUnboundKeybindings: true, ...defaultKeybindingLabelStyles }));
-				label.set(keys);
+				aiMsg.textContent = `AI: ${summary.reply}`;
+				chatHistory.push({ role: "assistant", content: summary.reply });
+			} catch (err) {
+				aiMsg.textContent = `AI: Lỗi khi tóm tắt: ${err}`;
 			}
-		};
+		});
 
-		update();
-		this.transientDisposables.add(this.keybindingService.onDidUpdateKeybindings(update));
 	}
 
-	private filterEntries(entries: WatermarkEntry[], shuffleEntries: boolean): WatermarkEntry[] {
-		const filteredEntries = entries
-			.filter(entry => (isWeb && !entry.when?.web) || (!isWeb && !entry.when?.native) || this.cachedWhen[entry.id])
-			.filter(entry => !!CommandsRegistry.getCommand(entry.id))
-			.filter(entry => !!this.keybindingService.lookupKeybinding(entry.id));
+	// private filterEntries(entries: WatermarkEntry[], shuffleEntries: boolean): WatermarkEntry[] {
+	// 	const filteredEntries = entries
+	// 		.filter(entry => (isWeb && !entry.when?.web) || (!isWeb && !entry.when?.native) || this.cachedWhen[entry.id])
+	// 		.filter(entry => !!CommandsRegistry.getCommand(entry.id))
+	// 		.filter(entry => !!this.keybindingService.lookupKeybinding(entry.id));
 
-		if (shuffleEntries) {
-			shuffle(filteredEntries);
-		}
+	// 	if (shuffleEntries) {
+	// 		shuffle(filteredEntries);
+	// 	}
 
-		return filteredEntries;
-	}
+	// 	return filteredEntries;
+	// }
 }
 
 registerColor('editorWatermark.foreground', { dark: transparent(editorForeground, 0.6), light: transparent(editorForeground, 0.68), hcDark: editorForeground, hcLight: editorForeground }, localize('editorLineHighlight', 'Foreground color for the labels in the editor watermark.'));
